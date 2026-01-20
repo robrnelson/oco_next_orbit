@@ -70,7 +70,7 @@ st.sidebar.header("Inputs")
 # Sliders linked to session state
 target_swath = st.sidebar.slider(
     "Target Swath Width (km)", 
-    min_value=100.0, max_value=5000.0, step=10.0,
+    min_value=10.0, max_value=5000.0, step=10.0,
     key='swath_val' 
 )
 
@@ -82,7 +82,7 @@ altitude = st.sidebar.slider(
 
 num_pixels = st.sidebar.slider(
     "Number of Pixels", 
-    min_value=100, max_value=5000, step=16,
+    min_value=8, max_value=5000, step=16,
     key='pixel_val'
 )
 
