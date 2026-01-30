@@ -213,9 +213,9 @@ if error:
 else:
     # --- Metrics ---
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Required FOV", f"{data['fov']:.2f}°")
-    c2.metric("Nadir Pixel", f"{data['w_nadir']:.3f} km")
-    c3.metric("Edge Pixel", f"{data['w_edge']:.2f} km")
+    c1.metric("Required Sensor FOV", f"{data['fov']:.2f}°")
+    c2.metric("Nadir Footprint Width", f"{data['w_nadir']:.3f} km")
+    c3.metric("Edge Footprint Width", f"{data['w_edge']:.2f} km")
     c4.metric("Distortion", f"{data['w_edge']/data['w_nadir']:.1f}x")
     
     st.markdown("---")
