@@ -1,67 +1,95 @@
 import streamlit as st
 import ephem
 import numpy as np
-import math
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 
 # --- 1. Physics & TLE Handling ---
 def get_altitude_from_tle(line1, line2):
-    """
-    Extracts the mean altitude from a TLE by calculating the semi-major axis 
-    from the Mean Motion.
-    """
-    # Parse Mean Motion (revs per day) from columns 52-63 of Line 2
-    mean_motion_revs_day = float(line2[52:63])
+    try:
+        mean_motion_revs_day = float(line2[52:63])
+    except ValueError:
+        return 828.0 # Fallback
     
-    # Constants
-    mu = 398600.4418  # Earth Gravitational Parameter km^3/s^2
-    Re = 6378.137     # Earth Radius km
-    
-    # Convert Mean Motion to rad/s
+    mu = 398600.4418
+    Re = 6378.137
     n_rad_s = mean_motion_revs_day * (2 * np.pi / 86400.0)
-    
-    # Kepler's 3rd Law: n^2 = mu / a^3  =>  a = (mu / n^2)^(1/3)
     semi_major_axis = (mu / n_rad_s**2)**(1/3)
-    
-    # Altitude = Semi-Major Axis - Earth Radius
     altitude = semi_major_axis - Re
     return altitude
 
-def propagate_orbit_tle(line1, line2, duration_hours=24, steps_per_orbit=60):
+def propagate_orbit_daytime_segments(line1, line2, duration_hours=24, steps_per_orbit=120):
     """
-    Uses PyEphem to propagate the orbit from a specific TLE.
+    Propagates the orbit and segments it into daytime passes.
+    Returns a list of segments, where each segment is a dict {'lats': [], 'lons': []}
     """
     sat = ephem.readtle("Sat", line1, line2)
+    start_date = sat._epoch.datetime()
     
-    # Start time (Now)
-    start_date = datetime.utcnow()
-    
-    lats = []
-    lons = []
-    
-    # Calculate step size based on orbital period
-    # Mean motion is in revs/day
-    mm = float(line2[52:63])
-    period_min = (24 * 60) / mm
+    # Calculate step size
+    try:
+        mm = float(line2[52:63])
+        period_min = (24 * 60) / mm
+    except:
+        period_min = 100.0
+        
     step_seconds = (period_min * 60) / steps_per_orbit
-    
     total_steps = int((duration_hours * 3600) / step_seconds)
+    
+    segments = []
+    current_segment = {'lats': [], 'lons': []}
+    is_in_daylight = False
+    
+    sun = ephem.Sun()
+    observer = ephem.Observer()
+    observer.elevation = 0 # Sea level check
     
     for i in range(total_steps):
         t = start_date + timedelta(seconds=i*step_seconds)
+        
         sat.compute(t)
         
-        # Ephem returns radians
-        lats.append(np.degrees(sat.sublat))
-        lons.append(np.degrees(sat.sublong))
+        # Check Sun Elevation at Sub-Satellite Point
+        observer.lat = sat.sublat
+        observer.lon = sat.sublong
+        observer.date = t
+        sun.compute(observer)
         
-    return lats, lons
+        # Sun altitude > -6 degrees (Civil Twilight) or 0 (Geometric Day)
+        # Using -0.1 to avoid flickering at the terminator
+        sun_is_up = np.degrees(sun.alt) > -0.5 
+        
+        if sun_is_up:
+            if not is_in_daylight:
+                # DAWN: Start a new segment
+                if len(current_segment['lats']) > 1:
+                    segments.append(current_segment)
+                current_segment = {'lats': [], 'lons': []}
+                is_in_daylight = True
+            
+            # Add point to current daytime segment
+            current_segment['lats'].append(np.degrees(sat.sublat))
+            current_segment['lons'].append(np.degrees(sat.sublong))
+            
+        else:
+            if is_in_daylight:
+                # DUSK: End the current segment
+                if len(current_segment['lats']) > 1:
+                    segments.append(current_segment)
+                # Reset
+                current_segment = {'lats': [], 'lons': []}
+                is_in_daylight = False
+    
+    # Capture the last segment if it ended in daylight
+    if is_in_daylight and len(current_segment['lats']) > 1:
+        segments.append(current_segment)
+        
+    return segments, start_date
 
-def calculate_swath_edges(lats, lons, swath_km):
+def calculate_polygon_edges(lats, lons, swath_km):
     """
-    Calculates Left/Right edge coordinates using spherical trigonometry.
+    Given a single segment center track, calculate the Left and Right edge coordinates.
     """
     R = 6378.137
     half_swath = swath_km / 2.0
@@ -76,12 +104,12 @@ def calculate_swath_edges(lats, lons, swath_km):
         lat2 = np.radians(lats[i+1])
         lon2 = np.radians(lons[i+1])
         
-        # Bearing
         d_lon = lon2 - lon1
         y = np.sin(d_lon) * np.cos(lat2)
         x = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(d_lon)
         bearing = np.arctan2(y, x)
         
+        # Left (-90) and Right (+90)
         for angle_offset, lat_list, lon_list in [(-np.pi/2, left_lats, left_lons), (np.pi/2, right_lats, right_lons)]:
             theta = bearing + angle_offset
             
@@ -94,7 +122,6 @@ def calculate_swath_edges(lats, lons, swath_km):
             lon_list.append(np.degrees(lon_new))
             
     return left_lats, left_lons, right_lats, right_lons
-
 
 # --- 2. Session State ---
 if 'swath_val' not in st.session_state:
@@ -111,7 +138,14 @@ def calculate_metrics(target_swath, num_pixels, altitude):
     h = altitude
     Re = 6378.137
     K = (Re + h) / Re
-    gamma_max = np.arccos(1/K)
+    
+    if h < 100: return None, "Altitude too low."
+
+    try:
+        gamma_max = np.arccos(1/K)
+    except:
+        return None, "Geometric Error (Altitude too low?)"
+        
     max_swath = 2 * Re * gamma_max
     
     if target_swath >= max_swath:
@@ -143,7 +177,7 @@ def calculate_metrics(target_swath, num_pixels, altitude):
 
 # --- 4. Streamlit UI ---
 st.set_page_config(page_title="Orbit Designer", layout="wide")
-st.title("🛰️ TLE Orbit & Swath Designer")
+st.title("🛰️ Daytime Orbit Visualizer")
 
 # --- Sidebar ---
 st.sidebar.header("Mission Parameters")
@@ -152,17 +186,16 @@ st.sidebar.header("Mission Parameters")
 st.sidebar.subheader("Satellite TLE")
 default_tle_1 = "1 43013U 17073A   22146.79629330  .00000059  00000-0  48737-4 0  9990"
 default_tle_2 = "2 43013  98.7159  85.6898 0001514  97.0846 263.0503 14.19554052234151"
-
 tle_line1 = st.sidebar.text_input("Line 1", value=default_tle_1)
 tle_line2 = st.sidebar.text_input("Line 2", value=default_tle_2)
 
-# Calculate Altitude from TLE
+# Calculate Altitude
 try:
     derived_altitude = get_altitude_from_tle(tle_line1, tle_line2)
     st.sidebar.success(f"Orbit Altitude: **{derived_altitude:.1f} km**")
 except Exception as e:
     st.sidebar.error("Invalid TLE")
-    derived_altitude = 828.0 # Fallback
+    derived_altitude = 828.0 
 
 # Other Sliders
 target_swath = st.sidebar.slider("Swath Width (km)", 100.0, 3000.0, step=10.0, key='swath_val')
@@ -178,7 +211,7 @@ data, error = calculate_metrics(target_swath, num_pixels, derived_altitude)
 if error:
     st.error(error)
 else:
-    # --- Metrics Section ---
+    # --- Metrics ---
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Required FOV", f"{data['fov']:.2f}°")
     c2.metric("Nadir Pixel", f"{data['w_nadir']:.3f} km")
@@ -188,7 +221,7 @@ else:
     st.markdown("---")
     
     # --- TABS ---
-    tab1, tab2 = st.tabs(["📊 Pixel Analysis", "🌍 3D Orbit Visualizer"])
+    tab1, tab2 = st.tabs(["📊 Pixel Analysis", "🌍 3D Swath (Daytime Only)"])
     
     with tab1:
         col1, col2 = st.columns([1, 2])
@@ -196,7 +229,6 @@ else:
             st.info("Analysis of pixel growth from Nadir to Swath Edge.")
             st.write(f"**Calculated Altitude:** {derived_altitude:.1f} km")
             st.write(f"**Target Swath:** {target_swath} km")
-            st.caption("Green: Flat Earth Model\nRed: Real Curved Earth")
             
         with col2:
             angles = np.linspace(-data['theta_rad'], data['theta_rad'], 100)
@@ -222,52 +254,57 @@ else:
             st.pyplot(fig)
 
     with tab2:
-        st.subheader("Real-Time Ground Track (24h)")
-        st.write("Visualizing orbit from provided TLE (NOAA-20 / JPSS-1).")
+        st.subheader("Daytime Coverage Visualization")
+        st.write("Displaying only orbit segments where the satellite is in sunlight.")
         
-        with st.spinner("Propagating TLE..."):
-            # 1. Propagate Center Track
-            lats, lons = propagate_orbit_tle(tle_line1, tle_line2, duration_hours=24)
-            
-            # 2. Calculate Swath Edges
-            lats_L, lons_L, lats_R, lons_R = calculate_swath_edges(lats, lons, target_swath)
-            
-            # 3. Plotly Globe
+        with st.spinner("Calculating Day/Night cycles and Swath Geometry..."):
+            # 1. Get List of Daytime Segments
+            segments, sim_date = propagate_orbit_daytime_segments(tle_line1, tle_line2, duration_hours=24)
+            st.success(f"Visualizing Date: {sim_date.strftime('%Y-%m-%d')} | Found {len(segments)} daytime passes.")
+
+            # 2. Build Plotly Figure
             fig3d = go.Figure()
             
-            # Center Track
-            fig3d.add_trace(go.Scattergeo(
-                lon = lons, lat = lats,
-                mode = 'lines',
-                line = dict(width=1, color='white', dash='dot'),
-                name = 'Nadir Track',
-                opacity = 0.5
-            ))
-            
-            # Left Edge
-            fig3d.add_trace(go.Scattergeo(
-                lon = lons_L, lat = lats_L,
-                mode = 'lines',
-                line = dict(width=1, color='cyan'),
-                name = 'Left Edge',
-                opacity = 0.8
-            ))
-            
-            # Right Edge
-            fig3d.add_trace(go.Scattergeo(
-                lon = lons_R, lat = lats_R,
-                mode = 'lines',
-                line = dict(width=1, color='cyan'),
-                name = 'Right Edge',
-                opacity = 0.8
-            ))
+            # 3. Iterate over segments and plot filled polygons
+            for seg in segments:
+                lats = seg['lats']
+                lons = seg['lons']
+                
+                if len(lats) < 5: continue # Skip tiny segments
+                
+                # Calculate edges for this specific segment
+                lats_L, lons_L, lats_R, lons_R = calculate_polygon_edges(lats, lons, target_swath)
+                
+                # Construct the Closed Polygon (Counter-Clockwise)
+                # Left Edge -> Right Edge (Reversed) -> Close Loop
+                poly_lats = lats_L + lats_R[::-1] + [lats_L[0]]
+                poly_lons = lons_L + lons_R[::-1] + [lons_L[0]]
+                
+                fig3d.add_trace(go.Scattergeo(
+                    lon = poly_lons,
+                    lat = poly_lats,
+                    mode = 'lines',
+                    fill = 'toself',
+                    fillcolor = 'rgba(0, 255, 255, 0.3)', # Cyan, Transparent
+                    line = dict(width=0, color='cyan'), # No border line
+                    hoverinfo = 'skip'
+                ))
+                
+                # Optional: Add center line for reference
+                fig3d.add_trace(go.Scattergeo(
+                    lon = lons, lat = lats,
+                    mode = 'lines',
+                    line = dict(width=1, color='white', dash='dot'),
+                    opacity=0.5,
+                    hoverinfo='skip'
+                ))
 
             fig3d.update_geos(
                 projection_type="orthographic",
                 showcoastlines=True, coastlinecolor="RebeccaPurple",
                 showland=True, landcolor="rgb(20, 20, 40)",
                 showocean=True, oceancolor="rgb(10, 10, 20)",
-                projection_rotation=dict(lon=-100, lat=40, roll=0)
+                projection_rotation=dict(lon=0, lat=20, roll=0)
             )
             
             fig3d.update_layout(
@@ -275,8 +312,9 @@ else:
                 margin={"r":0,"t":0,"l":0,"b":0},
                 paper_bgcolor="black",
                 font_color="white",
-                legend=dict(y=0.9, x=0.8)
+                showlegend=False
             )
             
             st.plotly_chart(fig3d, use_container_width=True)
+
 
