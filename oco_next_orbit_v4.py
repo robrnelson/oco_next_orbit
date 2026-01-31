@@ -249,6 +249,8 @@ else:
             ax.plot(np.degrees(angles), flat, color='#28a745', lw=2.5, ls='--', label='Flat Earth')
             ax.set_xlim(np.degrees(min(angles)), np.degrees(max(angles)))
             ax.set_ylim(0, max(curved)*1.15)
+            ax.set_xlabel("Latitude [deg]")
+            ax.set_ylabel("Footprint width [km]")
             ax.grid(True, ls='--', alpha=0.5)
             ax.legend()
             st.pyplot(fig)
